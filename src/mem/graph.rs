@@ -1,0 +1,571 @@
+//! graph.rs — Graph build + traversal via sqlx
+
+use serde::{Deserialize, Serialize};
+use sqlx::Row;
+use std::collections::{HashMap, HashSet};
+use std::io;
+
+use super::store::conn::memory_pool_sync;
+use super::store::util::{NODE_COLUMNS, row_to_graph_node};
+use crate::store::runtime;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub title: String,
+    #[serde(rename = "type")]
+    pub node_type: String,
+    pub tags: Vec<String>,
+    #[serde(default = "default_graph_importance")]
+    pub importance: f64,
+    #[serde(default)]
+    pub projects: Vec<String>,
+    #[serde(default)]
+    pub accessed_at: String,
+}
+
+fn default_graph_importance() -> f64 {
+    0.5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub source: String,
+    pub target: String,
+    pub relation: String,
+    pub weight: f64,
+    #[serde(
+        rename = "virtual",
+        skip_serializing_if = "std::ops::Not::not",
+        default
+    )]
+    pub virtual_: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Graph {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+/// Maximum number of edges returned in a graph payload.
+const MAX_GRAPH_EDGES: usize = 2000;
+/// Maximum number of virtual (computed) cross-project edges.
+const MAX_VIRTUAL_EDGES: usize = 500;
+
+/// Build a `Graph` value from the DB.
+#[allow(dead_code)]
+pub async fn build_graph_pool(pool: &sqlx::AnyPool) -> io::Result<Graph> {
+    build_graph_async(pool, true).await
+}
+
+/// Build a `Graph` value from the DB with optional virtual edges.
+#[allow(dead_code)]
+pub async fn build_graph_pool_virtual(
+    pool: &sqlx::AnyPool,
+    include_virtual: bool,
+) -> io::Result<Graph> {
+    build_graph_async(pool, include_virtual).await
+}
+
+fn build_graph_sync(include_virtual: bool) -> io::Result<Graph> {
+    let pool = memory_pool_sync()?;
+    runtime::block_on(build_graph_async(&pool, include_virtual))
+}
+
+async fn build_graph_async(pool: &sqlx::AnyPool, include_virtual: bool) -> io::Result<Graph> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {NODE_COLUMNS} FROM nodes ORDER BY updated DESC"
+    )))
+    .fetch_all(pool)
+    .await
+    .map_err(io::Error::other)?;
+
+    let nodes: Vec<GraphNode> = rows
+        .iter()
+        .map(|r| {
+            let gn = row_to_graph_node(r);
+            GraphNode {
+                id: gn.id,
+                title: gn.title,
+                node_type: gn.node_type,
+                tags: super::store::util::split_csv(&gn.tags),
+                importance: gn.importance,
+                projects: super::store::util::split_csv(&gn.projects),
+                accessed_at: gn.accessed_at,
+            }
+        })
+        .collect();
+
+    let mut edges: Vec<GraphEdge> = sqlx::query(
+        "SELECT source, target, label, created FROM edges ORDER BY created DESC LIMIT ?",
+    )
+    .bind(MAX_GRAPH_EDGES as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(io::Error::other)?
+    .iter()
+    .map(|r| GraphEdge {
+        source: r.get::<String, _>(0),
+        target: r.get::<String, _>(1),
+        relation: r.get::<String, _>(2),
+        weight: 1.0,
+        virtual_: false,
+    })
+    .collect();
+
+    if include_virtual {
+        let persisted = edges.len();
+        let budget = MAX_GRAPH_EDGES
+            .saturating_sub(persisted)
+            .min(MAX_VIRTUAL_EDGES);
+        if budget > 0 {
+            let mut vedges = generate_virtual_edges(&nodes);
+            vedges.truncate(budget);
+            edges.extend(vedges);
+        }
+    }
+
+    Ok(Graph { nodes, edges })
+}
+
+/// Generate virtual cross-project edges based on shared tags.
+///
+/// For each pair of nodes in different projects sharing at least one tag,
+/// creates a virtual edge with weight = Jaccard similarity of their tag sets.
+/// Nodes with no project assignment are excluded (an empty `projects` list
+/// would otherwise match every node and flood the graph).
+pub fn generate_virtual_edges(nodes: &[GraphNode]) -> Vec<GraphEdge> {
+    // Per-node deduped tag sets — guards against duplicate tags within a node
+    // inflating the Jaccard intersection.
+    let tag_sets: Vec<HashSet<&str>> = nodes
+        .iter()
+        .map(|n| n.tags.iter().map(String::as_str).collect())
+        .collect();
+
+    // Inverted index: tag -> node indices (each node appears at most once per tag).
+    let mut tag_index: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, set) in tag_sets.iter().enumerate() {
+        for tag in set {
+            tag_index.entry(tag).or_default().push(i);
+        }
+    }
+
+    // Accumulate the shared-tag count (Jaccard intersection) per cross-project
+    // pair. Keying on node indices avoids both per-pair String allocation and a
+    // separate id->index lookup map (the old map was built in O(n^2)).
+    let mut pair_shared: HashMap<(usize, usize), usize> = HashMap::new();
+    for indices in tag_index.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        for i in 0..indices.len() {
+            for j in (i + 1)..indices.len() {
+                let (a, b) = (indices[i], indices[j]);
+                let pa = &nodes[a].projects;
+                let pb = &nodes[b].projects;
+                // Skip same-project pairs and nodes lacking a project.
+                if pa.is_empty() || pb.is_empty() || pa.iter().any(|p| pb.contains(p)) {
+                    continue;
+                }
+                let key = if a <= b { (a, b) } else { (b, a) };
+                *pair_shared.entry(key).or_default() += 1;
+            }
+        }
+    }
+
+    let mut result: Vec<GraphEdge> = pair_shared
+        .into_iter()
+        .map(|((a, b), shared)| {
+            // shared >= 1 => union >= 1, so weight is always in (0.0, 1.0] — no
+            // clamp or zero-union guard needed. Weak edges fall out naturally via
+            // the weight sort + truncate below.
+            let union = tag_sets[a].union(&tag_sets[b]).count();
+            let weight = shared as f64 / union as f64;
+            GraphEdge {
+                source: nodes[a].id.clone(),
+                target: nodes[b].id.clone(),
+                relation: "shared_tag".to_string(),
+                weight,
+                virtual_: true,
+            }
+        })
+        .collect();
+
+    result.sort_by(|a, b| {
+        b.weight
+            .partial_cmp(&a.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    result.truncate(MAX_VIRTUAL_EDGES);
+    result
+}
+
+/// Build graph JSON string — pool variant.
+#[allow(dead_code)]
+pub async fn rebuild_graph_json_pool(pool: &sqlx::AnyPool) -> io::Result<String> {
+    let graph = build_graph_async(pool, true).await?;
+    serde_json::to_string_pretty(&graph).map_err(io::Error::other)
+}
+
+/// Build graph JSON string — pool variant with virtual edges control.
+pub async fn rebuild_graph_json_pool_virtual(
+    pool: &sqlx::AnyPool,
+    include_virtual: bool,
+) -> io::Result<String> {
+    let graph = build_graph_async(pool, include_virtual).await?;
+    serde_json::to_string_pretty(&graph).map_err(io::Error::other)
+}
+
+/// Build graph JSON string — sync wrapper.
+pub fn rebuild_graph_json() -> io::Result<String> {
+    let graph = build_graph_sync(true)?;
+    serde_json::to_string_pretty(&graph).map_err(io::Error::other)
+}
+
+/// Write the graph JSON to the graph file on disk.
+pub fn rebuild_graph() -> io::Result<()> {
+    let graph = build_graph_sync(true)?;
+    let data = serde_json::to_vec_pretty(&graph).map_err(io::Error::other)?;
+    use super::store::atomic_write;
+    use super::store::graph_path;
+    atomic_write(&graph_path(), &data)
+}
+
+/// Maximum seeds accepted per call.
+const MAX_SEED_IDS: usize = 100;
+
+/// Async 1-hop neighbors.
+pub async fn graph_neighbors_pool(pool: &sqlx::AnyPool, seed_ids: &[String]) -> Vec<(String, f64)> {
+    graph_neighbors_async(pool, seed_ids).await
+}
+
+fn graph_neighbors_sync(seed_ids: &[String]) -> Vec<(String, f64)> {
+    let pool = match memory_pool_sync() {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    runtime::block_on(graph_neighbors_async(&pool, seed_ids))
+}
+
+async fn graph_neighbors_async(pool: &sqlx::AnyPool, seed_ids: &[String]) -> Vec<(String, f64)> {
+    if seed_ids.is_empty() {
+        return vec![];
+    }
+    let seed_ids = if seed_ids.len() > MAX_SEED_IDS {
+        eprintln!(
+            "[mem/graph] graph_neighbors: seed_ids.len()={} exceeds MAX_SEED_IDS={}, truncating",
+            seed_ids.len(),
+            MAX_SEED_IDS
+        );
+        &seed_ids[..MAX_SEED_IDS]
+    } else {
+        seed_ids
+    };
+    // Find all nodes connected to any seed via edges
+    let mut results: Vec<(String, f64)> = vec![];
+
+    for seed_id in seed_ids {
+        let rows = sqlx::query(
+            "SELECT target FROM edges WHERE source = ? \
+             UNION \
+             SELECT source FROM edges WHERE target = ?",
+        )
+        .bind(seed_id)
+        .bind(seed_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        for row in rows {
+            let neighbor_id: String = row.get(0);
+            // Check if we already have this neighbor
+            if let Some(entry) = results.iter_mut().find(|(id, _)| id == &neighbor_id) {
+                entry.1 += 1.0; // Increment weight for additional connections
+            } else {
+                results.push((neighbor_id, 1.0));
+            }
+        }
+    }
+
+    results
+}
+
+/// Get 1-hop neighbors — sync wrapper.
+#[allow(dead_code)]
+pub fn graph_neighbors(seed_ids: &[String]) -> Vec<(String, f64)> {
+    graph_neighbors_sync(seed_ids)
+}
+
+/// Async BFS traversal.
+pub async fn related_nodes_pool(pool: &sqlx::AnyPool, start_id: &str, depth: usize) -> Vec<String> {
+    related_nodes_async(pool, start_id, depth).await
+}
+
+fn related_nodes_sync(start_id: &str, depth: usize) -> Vec<String> {
+    let pool = match memory_pool_sync() {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    runtime::block_on(related_nodes_async(&pool, start_id, depth))
+}
+
+async fn related_nodes_async(pool: &sqlx::AnyPool, start_id: &str, depth: usize) -> Vec<String> {
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(start_id.to_string());
+    let mut frontier: Vec<String> = vec![start_id.to_string()];
+
+    for _ in 0..depth {
+        let mut next_frontier = vec![];
+        for node_id in &frontier {
+            let rows = sqlx::query(
+                "SELECT target FROM edges WHERE source = ? \
+                 UNION \
+                 SELECT source FROM edges WHERE target = ?",
+            )
+            .bind(node_id)
+            .bind(node_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+
+            for row in rows {
+                let neighbor: String = row.get(0);
+                if visited.insert(neighbor.clone()) {
+                    next_frontier.push(neighbor);
+                }
+            }
+        }
+        frontier = next_frontier;
+        if frontier.is_empty() {
+            break;
+        }
+    }
+
+    visited.remove(start_id); // Don't include start node
+    visited.into_iter().collect()
+}
+
+/// BFS traversal from `start_id` — sync wrapper.
+pub fn related_nodes(start_id: &str, depth: usize) -> Vec<String> {
+    related_nodes_sync(start_id, depth)
+}
+
+/// Async compute aggregate stats.
+pub async fn compute_stats_pool(pool: &sqlx::AnyPool) -> io::Result<serde_json::Value> {
+    compute_stats_async(pool).await
+}
+
+/// Compute aggregate stats — sync.
+pub fn compute_stats() -> io::Result<serde_json::Value> {
+    let pool = memory_pool_sync()?;
+    runtime::block_on(compute_stats_async(&pool))
+}
+
+async fn compute_stats_async(pool: &sqlx::AnyPool) -> io::Result<serde_json::Value> {
+    let node_count: i64 = sqlx::query("SELECT COUNT(*) FROM nodes")
+        .fetch_one(pool)
+        .await
+        .map_err(io::Error::other)?
+        .get(0);
+
+    let edge_count: i64 = sqlx::query("SELECT COUNT(*) FROM edges")
+        .fetch_one(pool)
+        .await
+        .map_err(io::Error::other)?
+        .get(0);
+
+    let avg_importance: f64 = sqlx::query("SELECT AVG(importance) FROM nodes")
+        .fetch_one(pool)
+        .await
+        .map_err(io::Error::other)?
+        .try_get(0)
+        .unwrap_or(0.0);
+
+    let type_counts: std::collections::HashMap<String, i64> =
+        sqlx::query("SELECT type, COUNT(*) FROM nodes GROUP BY type")
+            .fetch_all(pool)
+            .await
+            .map_err(io::Error::other)?
+            .iter()
+            .map(|r| (r.get::<String, _>(0), r.get::<i64, _>(1)))
+            .collect();
+
+    Ok(serde_json::json!({
+        "nodes": node_count,
+        "edges": edge_count,
+        "avg_importance": (avg_importance * 1000.0).round() / 1000.0,
+        "types": type_counts,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GraphNode includes importance field serialized as JSON.
+    #[test]
+    fn graph_node_includes_importance() {
+        let n = GraphNode {
+            id: "test-1".to_string(),
+            title: "Test".to_string(),
+            node_type: "concept".to_string(),
+            tags: vec![],
+            importance: 0.85,
+            projects: vec![],
+            accessed_at: String::new(),
+        };
+        let json = serde_json::to_string(&n).unwrap();
+        assert!(
+            json.contains("\"importance\":0.85"),
+            "importance should appear in JSON: {json}"
+        );
+    }
+
+    // ── Virtual edge tests ──────────────────────────────────────
+
+    fn make_node(id: &str, tags: Vec<&str>, projects: Vec<&str>) -> GraphNode {
+        GraphNode {
+            id: id.to_string(),
+            title: id.to_string(),
+            node_type: "concept".to_string(),
+            tags: tags.into_iter().map(|t| t.to_string()).collect(),
+            importance: 0.5,
+            projects: projects.into_iter().map(|p| p.to_string()).collect(),
+            accessed_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn generate_virtual_edges_cross_project_only() {
+        let nodes = vec![
+            make_node("a", vec!["rust"], vec!["proj1"]),
+            make_node("b", vec!["rust"], vec!["proj2"]),
+            make_node("c", vec!["rust"], vec!["proj1"]),
+        ];
+        let edges = generate_virtual_edges(&nodes);
+        // a-b: cross-project (proj1 vs proj2) -> virtual edge
+        assert!(edges.iter().any(|e| e.source == "a" && e.target == "b"));
+        // a-c: same project (proj1) -> no edge
+        assert!(
+            !edges
+                .iter()
+                .any(|e| (e.source == "a" && e.target == "c")
+                    || (e.source == "c" && e.target == "a"))
+        );
+    }
+
+    #[test]
+    fn generate_virtual_edges_weight_jaccard() {
+        let nodes = vec![
+            make_node("a", vec!["x", "y"], vec!["p1"]),
+            make_node("b", vec!["x", "y", "z"], vec!["p2"]),
+            make_node("c", vec!["x"], vec!["p3"]),
+        ];
+        let edges = generate_virtual_edges(&nodes);
+        let ab = edges
+            .iter()
+            .find(|e| e.source == "a" && e.target == "b")
+            .unwrap();
+        let ac = edges
+            .iter()
+            .find(|e| e.source == "a" && e.target == "c")
+            .unwrap();
+        // Jaccard(a,b) = 2/3 ≈ 0.67, Jaccard(a,c) = 1/2 = 0.5
+        assert!(
+            ab.weight > ac.weight,
+            "ab weight ({}) should be > ac weight ({})",
+            ab.weight,
+            ac.weight
+        );
+    }
+
+    #[test]
+    fn generate_virtual_edges_no_tags() {
+        let nodes = vec![
+            make_node("a", vec![], vec!["p1"]),
+            make_node("b", vec![], vec!["p2"]),
+        ];
+        let edges = generate_virtual_edges(&nodes);
+        assert!(edges.is_empty(), "no tags -> no virtual edges");
+    }
+
+    #[test]
+    fn generate_virtual_edges_dedup() {
+        let nodes = vec![
+            make_node("a", vec!["x", "y", "z"], vec!["p1"]),
+            make_node("b", vec!["x", "y", "z"], vec!["p2"]),
+        ];
+        let edges = generate_virtual_edges(&nodes);
+        // Only one edge between a and b despite 3 shared tags
+        let count = edges
+            .iter()
+            .filter(|e| {
+                (e.source == "a" && e.target == "b") || (e.source == "b" && e.target == "a")
+            })
+            .count();
+        assert_eq!(count, 1, "should have exactly 1 edge between a and b");
+    }
+
+    #[test]
+    fn graph_edge_virtual_field_serialization() {
+        let persisted = GraphEdge {
+            source: "a".to_string(),
+            target: "b".to_string(),
+            relation: "related".to_string(),
+            weight: 1.0,
+            virtual_: false,
+        };
+        let json = serde_json::to_string(&persisted).unwrap();
+        assert!(
+            !json.contains("virtual"),
+            "persisted edge should not have virtual field: {json}"
+        );
+
+        let virt = GraphEdge {
+            source: "a".to_string(),
+            target: "b".to_string(),
+            relation: "shared_tag".to_string(),
+            weight: 0.5,
+            virtual_: true,
+        };
+        let vjson = serde_json::to_string(&virt).unwrap();
+        assert!(
+            vjson.contains("\"virtual\":true"),
+            "virtual edge should have virtual: true: {vjson}"
+        );
+    }
+
+    #[test]
+    fn generate_virtual_edges_empty_projects_excluded() {
+        let nodes = vec![
+            make_node("a", vec!["x"], vec![]),
+            make_node("b", vec!["x"], vec!["p1"]),
+        ];
+        let edges = generate_virtual_edges(&nodes);
+        assert!(
+            edges.is_empty(),
+            "node with no project must not get virtual edges"
+        );
+    }
+
+    #[test]
+    fn generate_virtual_edges_duplicate_tags_not_inflated() {
+        let nodes = vec![
+            make_node("a", vec!["x", "x", "y"], vec!["p1"]),
+            make_node("b", vec!["x", "y", "y"], vec!["p2"]),
+        ];
+        let edges = generate_virtual_edges(&nodes);
+        let ab = edges
+            .iter()
+            .find(|e| e.source == "a" && e.target == "b")
+            .expect("a-b cross-project edge should exist");
+        // Distinct tags are {x,y} for both => Jaccard = 2/2 = 1.0.
+        // Duplicate tags within a node must not inflate the weight above 1.0.
+        assert!(
+            (ab.weight - 1.0).abs() < 1e-9,
+            "expected Jaccard 1.0 for identical deduped tag sets, got {}",
+            ab.weight
+        );
+    }
+}
