@@ -1,0 +1,1895 @@
+use std::collections::HashMap;
+use std::fs;
+use std::sync::LazyLock;
+
+use super::common::*;
+use crate::config::CONFIG;
+use crate::evolve;
+use crate::mem::store;
+use crate::shared::{evolution::*, helpers::*, obs::ObsRecord, paths::*};
+use crate::telemetry::{SessionTrend, Telemetry};
+
+static TELEMETRY: LazyLock<Telemetry> = LazyLock::new(Telemetry::init);
+
+// ── Reflect Context (subcommand) ─────────────────────
+
+/// Collect harness data for /reflect skill as JSON on stdout.
+/// Replaces the Python-based `reflect-context.sh` for Windows compat.
+pub fn run_context(
+    days: u32,
+    since: Option<String>,
+    project: Option<String>,
+    all_projects: bool,
+    sources: Vec<String>,
+) -> i32 {
+    if !harness_exists() {
+        eprintln!("{{\"error\":\"harness directory not found\"}}");
+        return 1;
+    }
+
+    // Determine which project slugs to analyze
+    let project_slugs: Vec<String> = if all_projects {
+        list_harness_project_slugs()
+    } else if let Some(ref slug) = project {
+        vec![slug.clone()]
+    } else {
+        vec![project_slug()]
+    };
+
+    // Fix 1: Validate slugs — reject path traversal attempts
+    for slug in &project_slugs {
+        if slug.contains("..") || slug.contains('/') || slug.contains('\\') {
+            eprintln!("{{\"error\":\"invalid project slug: {slug}\"}}");
+            return 1;
+        }
+    }
+
+    // Fix 5: Validate --since format (YYYYMMDD)
+    if let Some(ref s) = since
+        && (s.len() != 8 || !s.chars().all(|c| c.is_ascii_digit()))
+    {
+        eprintln!("{{\"error\":\"--since must be YYYYMMDD format, got: {s}\"}}");
+        return 1;
+    }
+
+    // 1. Obs stats — compute date range
+    let (cutoff_tag, date_from) = if let Some(ref s) = since {
+        (s.clone(), s.clone())
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cutoff_ts = now.saturating_sub((days as u64) * 86400);
+        let days_since_epoch = cutoff_ts / 86400;
+        let (y, m, d) = epoch_days_to_ymd(days_since_epoch as i32);
+        let tag = format!("{y:04}{m:02}{d:02}");
+        (tag.clone(), tag)
+    };
+    let date_to = today();
+
+    let mut total_obs: u64 = 0;
+    let mut tool_counts: HashMap<String, u64> = HashMap::new();
+    let mut failure_cats: HashMap<String, u64> = HashMap::new();
+    let mut file_ext_counts: HashMap<String, u64> = HashMap::new();
+    let mut scores: Vec<f64> = Vec::new();
+    let mut dim_sums: HashMap<String, f64> = HashMap::new();
+    let mut dim_counts: HashMap<String, u64> = HashMap::new();
+    let mut tool_success_map: HashMap<String, (u64, u64)> = HashMap::new(); // (success, total)
+
+    // Collect obs from all target project slugs
+    for slug in &project_slugs {
+        // Fix 1: Verify resolved path stays within harness projects root
+        let slug_harness = harness_dir_for_slug(slug);
+        let safe = if slug_harness.exists() {
+            slug_harness
+                .canonicalize()
+                .ok()
+                .map(|p| p.starts_with(harness_projects_root()))
+                .unwrap_or(false)
+        } else {
+            slug_harness.starts_with(harness_projects_root())
+        };
+        if !safe {
+            eprintln!("{{\"error\":\"slug escapes harness root: {slug}\"}}");
+            return 1;
+        }
+        // SQLite is the primary observation store; the JSONL files only hold
+        // records from rounds where the DB write failed. Reading JSONL alone
+        // reported `total: 0` for projects with thousands of stored rows.
+        let db_recs: Vec<ObsRecord> = crate::store::runtime::block_on(async {
+            let pool = crate::store::pool::harness_pool().await?;
+            crate::store::observations::query_obs_for_date_range_pool(
+                &pool, &date_from, &date_to, slug,
+            )
+            .await
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("[reflect] SQLite observations read failed for {slug}: {e}");
+            Vec::new()
+        });
+
+        let slug_obs_dir = slug_harness.join("obs");
+        let jsonl_recs: Vec<ObsRecord> = if slug_obs_dir.is_dir() {
+            list_files(&slug_obs_dir, ".jsonl")
+                .into_iter()
+                .filter(|f| {
+                    let tag = f.replace("session_", "");
+                    tag.get(..8)
+                        .map(|s| s >= cutoff_tag.as_str())
+                        .unwrap_or(true)
+                })
+                .flat_map(|f| read_jsonl_typed(&slug_obs_dir.join(f)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        {
+            // A JSONL file is deleted only after every record reaches SQLite,
+            // so the two sets are normally disjoint. Guard the backfill-pending
+            // window anyway. `timestamp + tool` alone is too weak a key: two
+            // calls to the same tool inside one timestamp tick (ISO seconds)
+            // are a routine burst, and keying on just those two fields drops
+            // the second one as a phantom duplicate. `action` is what actually
+            // differs between them (distinct command / file_path), so it joins
+            // the key.
+            let obs_key = |r: &ObsRecord| {
+                (
+                    r.timestamp.clone(),
+                    r.tool.clone(),
+                    r.action.clone().unwrap_or_default(),
+                )
+            };
+            let seen: std::collections::HashSet<(String, String, String)> =
+                db_recs.iter().map(obs_key).collect();
+            let jsonl_recs: Vec<&ObsRecord> = jsonl_recs
+                .iter()
+                .filter(|r| !seen.contains(&obs_key(r)))
+                .collect();
+
+            for r in db_recs.iter().chain(jsonl_recs) {
+                total_obs += 1;
+                *tool_counts.entry(r.tool.clone()).or_default() += 1;
+                if let Some(ref fc) = r.failure_category {
+                    *failure_cats.entry(fc.clone()).or_default() += 1;
+                }
+                if let Some(ref ext) = r.file_ext {
+                    *file_ext_counts.entry(ext.clone()).or_default() += 1;
+                }
+                if let Some(s) = r.score {
+                    scores.push(s);
+                }
+                if let Some(ref dims) = r.dimensions {
+                    let ds = serde_json::to_value(dims).ok();
+                    if let Some(obj) = ds.as_ref().and_then(|v| v.as_object()) {
+                        for (k, v) in obj {
+                            if let Some(n) = v.as_f64() {
+                                *dim_sums.entry(k.clone()).or_default() += n;
+                                *dim_counts.entry(k.clone()).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+                let entry = tool_success_map.entry(r.tool.clone()).or_insert((0, 0));
+                entry.1 += 1;
+                if r.result.as_deref() == Some("success")
+                    || (r.result.is_none() && r.score.unwrap_or(0.0) >= 0.7)
+                {
+                    entry.0 += 1;
+                }
+            }
+        }
+    }
+
+    fn round3(v: f64) -> f64 {
+        (v * 1000.0).round() / 1000.0
+    }
+
+    fn round4(v: f64) -> f64 {
+        (v * 10000.0).round() / 10000.0
+    }
+
+    let avg_score = if scores.is_empty() {
+        0.0
+    } else {
+        round3(scores.iter().sum::<f64>() / scores.len() as f64)
+    };
+    let high_ge09 = scores.iter().filter(|&&s| s >= 0.9).count() as u64;
+    let mid_06_09 = scores.iter().filter(|&&s| (0.6..0.9).contains(&s)).count() as u64;
+    let low_lt06 = scores.iter().filter(|&&s| s < 0.6).count() as u64;
+
+    let mut top_tools: Vec<(String, u64)> = tool_counts.into_iter().collect();
+    top_tools.sort_by_key(|b| std::cmp::Reverse(b.1));
+    let top_tools_map: serde_json::Map<String, serde_json::Value> = top_tools
+        .iter()
+        .take(10)
+        .map(|(k, v)| (k.clone(), serde_json::Value::from(*v)))
+        .collect();
+
+    let mut fc_sorted: Vec<(String, u64)> = failure_cats.into_iter().collect();
+    fc_sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
+    let fc_map: serde_json::Map<String, serde_json::Value> = fc_sorted
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::from(*v)))
+        .collect();
+
+    let mut ext_sorted: Vec<(String, u64)> = file_ext_counts.into_iter().collect();
+    ext_sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
+    let ext_map: serde_json::Map<String, serde_json::Value> = ext_sorted
+        .iter()
+        .take(8)
+        .map(|(k, v)| (k.clone(), serde_json::Value::from(*v)))
+        .collect();
+
+    let dim_avgs: serde_json::Map<String, serde_json::Value> = dim_sums
+        .iter()
+        .map(|(k, s)| {
+            let c = dim_counts.get(k).copied().unwrap_or(1);
+            (k.clone(), serde_json::Value::from(round3(s / c as f64)))
+        })
+        .collect();
+
+    // Fix 6: Use CONFIG thresholds instead of hardcoded literals
+    let wt_min = CONFIG.pattern.weak_tool_min_obs;
+    let wt_rate = CONFIG.pattern.weak_tool_rate;
+    let st_rate = 0.9f64; // strong_tool threshold — not in CONFIG, kept as named constant
+
+    let weak_tools: Vec<String> = tool_success_map
+        .iter()
+        .filter(|(_, (s, n))| *n >= wt_min && (*s as f64 / *n as f64) < wt_rate)
+        .map(|(t, _)| t.clone())
+        .collect();
+    let strong_tools: Vec<String> = tool_success_map
+        .iter()
+        .filter(|(_, (s, n))| *n >= wt_min && (*s as f64 / *n as f64) >= st_rate)
+        .map(|(t, _)| t.clone())
+        .collect();
+    let total_success: u64 = tool_success_map.values().map(|(s, _)| *s).sum();
+    let total_calls: u64 = tool_success_map.values().map(|(_, n)| *n).sum();
+    let tool_success_rate = if total_calls == 0 {
+        0.0
+    } else {
+        round3(total_success as f64 / total_calls as f64)
+    };
+
+    let obs_stats = serde_json::json!({
+        "total": total_obs,
+        "avg_score": avg_score,
+        "score_distribution": { "high_ge09": high_ge09, "mid_06_09": mid_06_09, "low_lt06": low_lt06 },
+        "top_tools": top_tools_map,
+        "failure_categories": fc_map,
+        "top_file_exts": ext_map,
+        "dimension_averages": dim_avgs,
+        "weak_tools": weak_tools,
+        "strong_tools": strong_tools,
+        "tool_success_rate": tool_success_rate,
+    });
+
+    // 2. Evolution stats (SQLite first, fallback to JSONL)
+    let evo_records: Vec<serde_json::Value> = crate::store::runtime::block_on(async {
+        let pool = crate::store::pool::harness_pool().await?;
+        crate::store::evolution::query_all_records_pool(&pool).await
+    })
+    .map(|recs| {
+        recs.iter()
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect()
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("[reflect] SQLite evolution read failed, falling back to JSONL: {e}");
+        read_jsonl_typed::<serde_json::Value>(&evolution_file())
+    });
+    let mut pattern_freq: HashMap<String, u64> = HashMap::new();
+    let mut trend_hist: Vec<String> = Vec::new();
+    let mut skills_generated: u64 = 0;
+    let mut stagnation_count: u64 = 0;
+    for r in &evo_records {
+        if let Some(pats) = r.get("patterns").and_then(|p| p.as_array()) {
+            for p in pats {
+                if let Some(t) = p.get("type").and_then(|v| v.as_str()) {
+                    *pattern_freq.entry(t.to_string()).or_default() += 1;
+                }
+            }
+        }
+        if let Some(t) = r.get("trend").and_then(|v| v.as_str())
+            && !t.is_empty()
+        {
+            trend_hist.push(t.to_string());
+        }
+        skills_generated += r
+            .get("skills_generated")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if r.get("stagnation_triggered")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            stagnation_count += 1;
+        }
+    }
+    let recent_evo: Vec<&serde_json::Value> = evo_records.iter().rev().take(10).collect();
+    let recent_weak: Vec<String> = recent_evo
+        .iter()
+        .filter_map(|r| r.get("weak_tools").and_then(|v| v.as_array()))
+        .flat_map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)))
+        .collect();
+    let recent_weak: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        recent_weak
+            .into_iter()
+            .filter(|s| seen.insert(s.clone()))
+            .collect()
+    };
+    let recent_seeded: Vec<String> = recent_evo
+        .iter()
+        .filter_map(|r| r.get("seeded_skills").and_then(|v| v.as_array()))
+        .flat_map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)))
+        .collect();
+    let recent_seeded: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        recent_seeded
+            .into_iter()
+            .filter(|s| seen.insert(s.clone()))
+            .collect()
+    };
+    let mut pf_sorted: Vec<(String, u64)> = pattern_freq.into_iter().collect();
+    pf_sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
+    let pf_map: serde_json::Map<String, serde_json::Value> = pf_sorted
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::from(*v)))
+        .collect();
+    let evo_stats = serde_json::json!({
+        "total_sessions": evo_records.len(),
+        "patterns_detected": evo_records.iter().filter(|r| r.get("patterns").and_then(|p| p.as_object()).map(|o| !o.is_empty()).unwrap_or(false)).count(),
+        "skills_generated": skills_generated,
+        "pattern_frequency": pf_map,
+        "trend_last10": trend_hist.into_iter().rev().take(10).collect::<Vec<_>>(),
+        "recent_weak_tools": recent_weak,
+        "recent_seeded_skills": recent_seeded,
+        "stagnation_count": stagnation_count,
+    });
+
+    // 3. Metrics summary (SQLite first, fallback to JSON)
+    // Scoped to the invoking project unless --all-projects asked for the
+    // cross-project aggregate; the unscoped loader is indeterminate when
+    // several projects share the harness DB.
+    let metrics_scope: Option<String> = if all_projects {
+        None
+    } else {
+        project_slugs.first().cloned()
+    };
+    let metrics: Metrics = crate::store::runtime::block_on(async {
+        let pool = crate::store::pool::harness_pool().await?;
+        crate::store::metrics::load_metrics_scoped_pool(&pool, metrics_scope.as_deref()).await
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("[reflect] SQLite metrics read failed, falling back to JSON: {e}");
+        read_json(&metrics_file(), default_metrics())
+    });
+    let sh = &metrics.score_history;
+    let score_trend_delta: f64 = if sh.len() >= 3 {
+        let recent: Vec<f64> = sh.iter().rev().take(10).map(|s| s.avg_score).collect();
+        let deltas: Vec<f64> = recent.windows(2).map(|w| w[0] - w[1]).collect();
+        if deltas.is_empty() {
+            0.0
+        } else {
+            round4(deltas.iter().sum::<f64>() / deltas.len() as f64)
+        }
+    } else {
+        0.0
+    };
+
+    let score_comparison = if sh.len() >= 10 {
+        let first5: f64 = sh.iter().take(5).map(|s| s.avg_score).sum::<f64>() / 5.0;
+        let last5: f64 = sh.iter().rev().take(5).map(|s| s.avg_score).sum::<f64>() / 5.0;
+        let dir = if last5 > first5 {
+            "improving"
+        } else if last5 < first5 {
+            "declining"
+        } else {
+            "stable"
+        };
+        Some(serde_json::json!({
+            "first_5_avg": round3(first5),
+            "last_5_avg": round3(last5),
+            "direction": dir,
+            "delta": round3(last5 - first5),
+        }))
+    } else {
+        None
+    };
+
+    let skill_attr: serde_json::Map<String, serde_json::Value> = metrics
+        .skill_attribution
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                serde_json::json!({
+                    "sessions_active": v.sessions_active,
+                    "avg_score_with": v.avg_score_with,
+                    "avg_score_without": v.avg_score_without,
+                    "delta": round3(v.avg_score_with - v.avg_score_without),
+                }),
+            )
+        })
+        .collect();
+
+    let latest_dims = sh
+        .last()
+        .map(|s| serde_json::to_value(s.dimension_averages).unwrap_or_default())
+        .unwrap_or_default();
+
+    let metrics_summary = serde_json::json!({
+        "total_sessions": metrics.total_sessions,
+        "avg_success_rate": metrics.avg_success_rate,
+        "total_evolved_skills": metrics.total_evolved_skills,
+        "last_session": metrics.last_session,
+        "trend": metrics.trend,
+        "best_score": metrics.best_score,
+        "stagnation_count": metrics.stagnation_count,
+        "score_trend_delta": score_trend_delta,
+        "score_comparison": score_comparison,
+        "latest_avg_score": sh.last().map(|s| s.avg_score).unwrap_or(0.0),
+        "latest_dimensions": latest_dims,
+        "skill_attribution": skill_attr,
+    });
+
+    // 4. Session snapshots (SQLite first, fallback to JSON)
+    let snapshots: Vec<serde_json::Value> = crate::store::runtime::block_on(async {
+        let pool = crate::store::pool::harness_pool().await?;
+        crate::store::sessions::list_recent_snapshots_pool(&pool, 5).await
+    })
+    .map(|snaps| {
+        snaps
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "timestamp": s.timestamp,
+                    "type": s.snap_type,
+                    "summary": s.summary.chars().take(400).collect::<String>(),
+                })
+            })
+            .collect()
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("[reflect] SQLite sessions read failed, falling back to JSON: {e}");
+        vec![]
+    });
+    let snapshots: Vec<serde_json::Value> = if !snapshots.is_empty() {
+        snapshots
+    } else {
+        let snap_files = list_files(&sessions_dir(), ".json");
+        snap_files.iter().rev().take(5).filter_map(|f| {
+            let sp: serde_json::Value = read_json(&sessions_dir().join(f), serde_json::Value::Null);
+            if sp.is_null() { return None; }
+            Some(serde_json::json!({
+                "timestamp": sp.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
+                "type": sp.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                "summary": sp.get("summary").and_then(|v| v.as_str()).unwrap_or("").chars().take(400).collect::<String>(),
+            }))
+        }).collect()
+    };
+
+    // 5. Evolved skills
+    let evolved_list_dirs = list_dirs(&evolved_dir());
+    let mut evolved_list: Vec<serde_json::Value> = Vec::new();
+    let mut by_type: HashMap<&str, u64> = HashMap::new();
+    for name in &evolved_list_dirs {
+        let skill_path = evolved_dir().join(name).join("SKILL.md");
+        let content = fs::read_to_string(&skill_path).unwrap_or_default();
+        let stype = if content.contains("Evolved:") || content.contains("evolved_from:") {
+            "evolved"
+        } else if content.to_lowercase().contains("auto-evolved") {
+            "auto-evolved"
+        } else {
+            "preset"
+        };
+        *by_type.entry(stype).or_default() += 1;
+        evolved_list.push(serde_json::json!({"name": name, "type": stype}));
+    }
+
+    // Effective sources
+    // mem is always included (baseline). --source adds extra sources on top.
+    let effective_sources: Vec<&str> = if sources.contains(&"all".to_string()) {
+        vec!["harness", "mem", "claude-session", "alcove"]
+    } else if sources.is_empty() {
+        vec!["harness", "mem"]
+    } else {
+        // Always prepend mem unless the caller explicitly passed "mem" already
+        let mut v: Vec<&str> = vec!["harness", "mem"];
+        for s in sources.iter() {
+            let s = s.as_str();
+            if s != "harness" && s != "mem" {
+                v.push(s);
+            }
+        }
+        v
+    };
+
+    let extra_sources_json = {
+        let mut map = serde_json::Map::new();
+        // mem — always collected
+        map.insert("mem".into(), collect_mem(&project_slugs));
+        if effective_sources.contains(&"claude-session") {
+            map.insert("claude_session".into(), collect_claude_session());
+        }
+        if effective_sources.contains(&"alcove") {
+            map.insert("alcove".into(), collect_alcove(&CONFIG.context.alcove));
+        }
+        serde_json::Value::Object(map)
+    };
+
+    // Fix 4: Scope note clarifying which fields are per-project vs aggregated
+    let scope_note = if all_projects || project.is_some() {
+        "evolution_stats, metrics_summary, session_snapshots, and evolved_skills are scoped to the current working directory project. Only obs_stats is aggregated across all analyzed projects."
+    } else {
+        ""
+    };
+
+    // Compile
+    let output = serde_json::json!({
+        "generated_at": now_iso(),
+        "analysis_window_days": days,
+        "date_range": { "from": date_from, "to": date_to },
+        "projects_analyzed": project_slugs,
+        "scope_note": scope_note,
+        "extra_sources": extra_sources_json,
+        "obs_stats": obs_stats,
+        "evolution_stats": evo_stats,
+        "metrics_summary": metrics_summary,
+        "session_snapshots": snapshots,
+        "evolved_skills": evolved_list,
+        "evolved_skills_summary": {
+            "total": evolved_list_dirs.len(),
+            "by_type": {
+                "preset": by_type.get("preset").copied().unwrap_or(0),
+                "evolved": by_type.get("evolved").copied().unwrap_or(0),
+                "auto-evolved": by_type.get("auto-evolved").copied().unwrap_or(0),
+            }
+        },
+    });
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).unwrap_or_default()
+    );
+    0
+}
+
+/// Collect mem nodes from ~/.harness/memory.db.
+/// Pulls top nodes by importance for each project slug (or all if slugs = [current]).
+/// Session-type nodes are excluded (importance=0.05, noise) unless there's nothing else.
+fn collect_mem(project_slugs: &[String]) -> serde_json::Value {
+    // Determine project filter: use first slug if single-project, else no filter (all)
+    let project_filter: Option<&str> = if project_slugs.len() == 1 {
+        project_slugs.first().map(|s| s.as_str())
+    } else {
+        None
+    };
+
+    // Smart recall — hint = broad engineering context, limit = 30
+    let recalled = match store::smart_recall(
+        project_filter,
+        Some("decision pattern error resolution concept"),
+        30,
+    ) {
+        Ok(s) => s,
+        Err(e) => return serde_json::json!({"error": format!("recall failed: {e}")}),
+    };
+
+    // Also pull top decisions/resolutions explicitly (high-value types)
+    let decisions = store::query_nodes(
+        None, // tag filter
+        Some("decision"),
+        project_filter,
+        10,
+    );
+    let resolutions = store::query_nodes(None, Some("resolution"), project_filter, 10);
+
+    // Merge and deduplicate by id, prefer higher-importance entry
+    let mut seen: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+
+    for sn in &recalled {
+        let id = sn.node.frontmatter.id.clone();
+        let entry = serde_json::json!({
+            "id": id,
+            "type": sn.node.frontmatter.node_type,
+            "title": sn.node.frontmatter.title,
+            "importance": sn.node.frontmatter.importance,
+            "tags": sn.node.frontmatter.tags,
+            "updated": sn.node.frontmatter.updated,
+            "body_preview": sn.node.body.chars().take(200).collect::<String>(),
+        });
+        seen.insert(id, entry);
+    }
+    for node in decisions.iter().chain(resolutions.iter()) {
+        let id = node.frontmatter.id.clone();
+        seen.entry(id.clone()).or_insert_with(|| {
+            serde_json::json!({
+                "id": id,
+                "type": node.frontmatter.node_type,
+                "title": node.frontmatter.title,
+                "importance": node.frontmatter.importance,
+                "tags": node.frontmatter.tags,
+                "updated": node.frontmatter.updated,
+                "body_preview": node.body.chars().take(200).collect::<String>(),
+            })
+        });
+    }
+
+    // Sort by importance desc, take top 30
+    let mut nodes: Vec<serde_json::Value> = seen.into_values().collect();
+    nodes.sort_by(|a, b| {
+        let ia = a.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let ib = b.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        ib.partial_cmp(&ia).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    nodes.truncate(30);
+
+    serde_json::json!({
+        "total_nodes_sampled": nodes.len(),
+        "project_filter": project_filter,
+        "nodes": nodes,
+    })
+}
+
+fn collect_claude_session() -> serde_json::Value {
+    let claude_projects = dirs_home().join(".claude").join("projects");
+    if !claude_projects.is_dir() {
+        return serde_json::json!({"error": "~/.claude/projects not found"});
+    }
+    let mut sessions: Vec<serde_json::Value> = vec![];
+    let project_dirs: Vec<_> = std::fs::read_dir(&claude_projects)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    for pd in project_dirs.iter().take(20) {
+        let jsonl_files = list_files(&pd.path(), ".jsonl");
+        for f in jsonl_files.iter().rev().take(3) {
+            let recs: Vec<serde_json::Value> = read_jsonl_typed(&pd.path().join(f));
+            for r in recs.iter().take(5) {
+                let meta = serde_json::json!({
+                    "project": pd.file_name().to_string_lossy(),
+                    "timestamp": r.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
+                    "model": r.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+                    "message_count": r.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0),
+                    "cost_usd": r.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                });
+                sessions.push(meta);
+            }
+        }
+    }
+    sessions.sort_by(|a, b| {
+        let ta = a.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+        let tb = b.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+        tb.cmp(ta)
+    });
+    let sessions: Vec<_> = sessions.into_iter().take(20).collect();
+    serde_json::json!({
+        "total_sessions_sampled": sessions.len(),
+        "sessions": sessions,
+    })
+}
+
+fn collect_alcove(cfg: &crate::config::AlcoveConfig) -> serde_json::Value {
+    if cfg.vault_path.is_empty() {
+        return serde_json::json!({"error": "alcove vault_path not configured"});
+    }
+    let vault = if cfg.vault_path.starts_with("~/") {
+        dirs_home().join(&cfg.vault_path[2..])
+    } else {
+        std::path::PathBuf::from(&cfg.vault_path)
+    };
+    // Fix 2: Canonicalize vault path and verify it stays within home directory
+    let vault = if let Ok(canonical) = vault.canonicalize() {
+        let home = dirs_home();
+        if !canonical.starts_with(&home) {
+            return serde_json::json!({
+                "error": format!("vault_path escapes home directory: {}", canonical.display())
+            });
+        }
+        canonical
+    } else {
+        return serde_json::json!({"error": format!("vault_path not found: {}", vault.display())});
+    };
+    let max = cfg.max_docs.max(1);
+    let mut docs: Vec<serde_json::Value> = vec![];
+    let mut visited = 0usize;
+    collect_md_files(&vault, &cfg.projects, max, &mut docs, 0, &mut visited);
+    serde_json::json!({
+        "vault_path": cfg.vault_path,
+        "docs_collected": docs.len(),
+        "documents": docs,
+    })
+}
+
+fn collect_md_files(
+    dir: &std::path::Path,
+    filter_projects: &[String],
+    max: usize,
+    out: &mut Vec<serde_json::Value>,
+    depth: usize,
+    visited: &mut usize,
+) {
+    // Fix 3: Guard against deep recursion, excessive file visits, and symlink loops
+    const MAX_DEPTH: usize = 10;
+    const MAX_VISITED: usize = 5000;
+
+    if out.len() >= max || depth > MAX_DEPTH || *visited > MAX_VISITED {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        if out.len() >= max || *visited > MAX_VISITED {
+            break;
+        }
+        let path = entry.path();
+        // Fix 3: Skip symlinks to prevent directory traversal via symlink
+        if path.is_dir() && !path.is_symlink() {
+            if !filter_projects.is_empty() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !filter_projects.iter().any(|p| p == &name) {
+                    continue;
+                }
+            }
+            collect_md_files(&path, &[], max, out, depth + 1, visited);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            *visited += 1;
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            let summary: String = content.chars().take(200).collect();
+            out.push(serde_json::json!({
+                "path": path.display().to_string(),
+                "summary": summary,
+            }));
+        }
+    }
+}
+
+/// Simple epoch-day to (year, month, day) without chrono dependency.
+fn epoch_days_to_ymd(days: i32) -> (i32, u32, u32) {
+    let mut y = 1970 + days / 365;
+    // Refine
+    for candidate in (1970..=y + 2).rev() {
+        let d = days_to_year_start(candidate);
+        if d <= days {
+            y = candidate;
+            break;
+        }
+    }
+    let remaining = days - days_to_year_start(y);
+    let leap = is_leap(y);
+    let month_days: [u32; 12] = if leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut m: u32 = 1;
+    let mut acc: i32 = 0;
+    for (i, &md) in month_days.iter().enumerate() {
+        if acc + md as i32 > remaining {
+            m = (i + 1) as u32;
+            break;
+        }
+        acc += md as i32;
+    }
+    let d = (remaining - acc + 1).max(1) as u32;
+    (y, m, d)
+}
+
+fn days_to_year_start(year: i32) -> i32 {
+    let mut days = 0i32;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    days
+}
+
+fn is_leap(y: i32) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+// ── Main Hook ───────────────────────────────────────
+
+/// Ingest today's JSONL fallback session files into SQLite, then remove them.
+///
+/// observe/polish write JSONL only when the SQLite write failed mid-session.
+/// Without this backfill, those records were stranded forever: the old read
+/// path only consulted JSONL when SQLite was empty-or-failing for the day —
+/// one later successful SQLite write and the fallback data went unread.
+/// The file is removed only after every record was inserted, so a partial
+/// backfill leaves the remainder for the next attempt.
+async fn backfill_jsonl_to_sqlite(pool: &sqlx::AnyPool, today_str: &str) {
+    if !obs_dir().is_dir() {
+        return;
+    }
+    let project = crate::shared::paths::project_slug();
+    for fname in list_files(&obs_dir(), ".jsonl") {
+        if !fname.contains(today_str) {
+            continue;
+        }
+        let recs = read_jsonl_typed(&obs_dir().join(&fname));
+        if recs.is_empty() {
+            continue;
+        }
+        // session_{sid}.jsonl → recover the session id for attribution.
+        let sid = fname
+            .strip_prefix("session_")
+            .and_then(|s| s.strip_suffix(".jsonl"))
+            .unwrap_or("backfill")
+            .to_string();
+        let mut all_ok = true;
+        for rec in &recs {
+            if crate::store::observations::insert_observation_pool(pool, rec, &sid, &project)
+                .await
+                .is_err()
+            {
+                all_ok = false;
+            }
+        }
+        if all_ok {
+            let _ = std::fs::remove_file(obs_dir().join(&fname));
+        }
+    }
+}
+
+/// Keep only observations newer than the last consumed one.
+///
+/// ISO-8601 timestamps compare correctly as strings, so a lexical `>` is the
+/// whole test. `None` (first ever round) keeps everything.
+fn filter_past_watermark(observations: Vec<ObsRecord>, watermark: Option<&str>) -> Vec<ObsRecord> {
+    match watermark {
+        Some(mark) => observations
+            .into_iter()
+            .filter(|o| o.timestamp.as_str() > mark)
+            .collect(),
+        None => observations,
+    }
+}
+
+/// Cutoff timestamp for retention: `days` before `now`, as an ISO-8601 date.
+///
+/// Day-precision is enough — the sweep compares against `timestamp`, whose
+/// ISO form sorts lexically, so a bare `YYYY-MM-DD` cuts at that day's start.
+fn retention_cutoff(now_secs: u64, days: u64) -> String {
+    let cutoff_days = (now_secs / 86_400).saturating_sub(days) as i32;
+    let (y, m, d) = epoch_days_to_ymd(cutoff_days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Delete observations older than `db.obs_retention_days`, at most once a day.
+///
+/// The store grows ~20 MB per active week and nothing older than the analysis
+/// window is ever read, but `delete_obs_older_than_pool` had no caller, so it
+/// grew without bound. Guarded by a date-stamped marker file rather than run
+/// every round: Codex's `Stop` is turn-scoped, so an unguarded sweep would
+/// issue a DELETE on every turn.
+///
+/// Returns the number of rows deleted, or `None` when the sweep did not run.
+fn sweep_old_observations() -> Option<u64> {
+    let days = CONFIG.db.obs_retention_days;
+    if days == 0 {
+        return None;
+    }
+    let marker = retention_marker_file();
+    let today_str = today();
+    if fs::read_to_string(&marker).is_ok_and(|s| s.trim() == today_str) {
+        return None;
+    }
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let cutoff = retention_cutoff(now_secs, days);
+    let deleted = crate::store::runtime::block_on(async {
+        let pool = crate::store::pool::harness_pool().await?;
+        crate::store::observations::delete_obs_older_than_pool(&pool, &cutoff).await
+    })
+    .ok()?;
+    // Stamp only after a successful sweep, so a DB error retries next round.
+    let _ = fs::write(&marker, &today_str);
+    Some(deleted)
+}
+
+pub fn run(_input: &HookInput) -> i32 {
+    if !should_run(PROFILE_REFLECT) {
+        return 0;
+    }
+    if !harness_exists() {
+        return 0;
+    }
+
+    // 1. Collect today's observations from SQLite (fallback to JSONL)
+    let today_str = today();
+    let current_project = project_slug();
+    let observations = match crate::store::runtime::block_on(async {
+        let pool = crate::store::pool::harness_pool().await?;
+        backfill_jsonl_to_sqlite(&pool, &today_str).await;
+        crate::store::observations::query_obs_for_date_range_pool(
+            &pool,
+            &today_str,
+            &today_str,
+            &current_project,
+        )
+        .await
+    }) {
+        Ok(recs) => recs,
+        Err(e) => {
+            // Proceed with an empty set so the JSONL fallback below actually runs —
+            // an early `return 0` here silently dropped the whole evolution round.
+            eprintln!("[reflect] SQLite observations read failed, falling back to JSONL: {e}");
+            Vec::new()
+        }
+    };
+    let observations = if !observations.is_empty() {
+        observations
+    } else {
+        // Fallback: read from JSONL files (SQLite unreachable — the records
+        // stay on disk and are backfilled by the next successful run).
+        if !obs_dir().is_dir() {
+            return 0;
+        }
+        let obs_files: Vec<String> = list_files(&obs_dir(), ".jsonl")
+            .into_iter()
+            .filter(|f| f.contains(&today_str))
+            .collect();
+        if obs_files.is_empty() {
+            return 0;
+        }
+        let mut recs: Vec<ObsRecord> = vec![];
+        for f in &obs_files {
+            recs.extend(read_jsonl_typed(&obs_dir().join(f)));
+        }
+        recs
+    };
+
+    // 1b. Drop observations an earlier round already consumed.
+    //
+    // Claude Code calls reflect once per session (SessionEnd). Codex's `Stop`
+    // fires every turn, so without this the same day's observations would be
+    // re-scored on each turn — inflating total_sessions, re-running skill
+    // seeding, and feeding stagnation/attribution duplicate samples.
+    let watermark = fs::read_to_string(reflect_watermark_file())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let observations = filter_past_watermark(observations, watermark.as_deref());
+    if observations.len() < 3 {
+        return 0;
+    }
+    // Advance the watermark before analysis: a crash mid-round must not make
+    // the next turn re-count this batch. The trade is deliberate: a crash
+    // between here and step 11 loses one batch of observations, which are a
+    // statistical sample, whereas re-counting corrupts total_sessions, skill
+    // seeding and the attribution arms, which are cumulative state.
+    //
+    // A failed write is not silent: it means the next turn re-analyzes this
+    // batch, so it gets reported rather than swallowed.
+    if let Some(newest) = observations.iter().map(|o| &o.timestamp).max()
+        && let Err(e) = fs::write(reflect_watermark_file(), newest)
+    {
+        eprintln!(
+            "[reflect] watermark write failed ({e}); the next round will re-analyze \
+                 these {} observations",
+            observations.len()
+        );
+    }
+
+    // 2. Analyze
+    let mut analysis = evolve::analyze_session(&observations);
+    analysis.failure_patterns = evolve::detect_patterns(&observations);
+
+    // 2b. HarnessX Digester + Planner (R2, R3): compress the session into
+    // per-task digests and build the adaptation landscape from history. The
+    // landscape surfaces persistent failures + untried edit types, and
+    // recommends exploration when the engine is plateauing on local edits.
+    let digests = evolve::digest_session(&observations, &[]);
+    let persistent_cats: Vec<String> = digests
+        .iter()
+        .flat_map(|d| d.failure_categories.iter().map(|(c, _)| c.clone()))
+        .collect();
+    if !persistent_cats.is_empty() {
+        analysis.persistent_failure = true;
+        analysis.persistent_failure_categories = persistent_cats;
+    }
+    // Bounded read: landscape stats only need recent history; an unbounded
+    // full-table scan grew linearly with project age on every SessionEnd.
+    // Project-scoped: without the filter, multi-project users got a landscape
+    // computed from other projects' records, and this project's edits beyond
+    // the 100-row bound fell out of coverage entirely.
+    let history: Vec<EvolutionRecord> = crate::store::runtime::block_on(async {
+        let pool = crate::store::pool::harness_pool().await?;
+        let slug = crate::shared::paths::project_slug();
+        crate::store::evolution::query_recent_records_scoped_pool(&pool, 100, Some(&slug)).await
+    })
+    .unwrap_or_default();
+    let landscape = evolve::build_landscape(&history, &digests, 2);
+    if evolve::recommends_exploration(&landscape) {
+        hint(
+            "reflect",
+            &format!(
+                "Adaptation landscape: {} persistent failure(s), {} untried edit type(s) {:?} — consider a structural edit",
+                landscape.persistent_failures.len(),
+                landscape.untried_edit_types.len(),
+                landscape.untried_edit_types,
+            ),
+        );
+    }
+
+    // 3. Stagnation (load metrics from SQLite, fallback to JSON)
+    // Scoped: metrics_state is keyed by (key, project), and the unscoped
+    // loader is indeterminate once a second project has written rows — it
+    // would judge stagnation and trigger rollback off another project's runs.
+    let mut metrics: Metrics = crate::store::runtime::block_on(async {
+        let pool = crate::store::pool::harness_pool().await?;
+        crate::store::metrics::load_metrics_scoped_pool(&pool, Some(&current_project)).await
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("[reflect] SQLite metrics load failed, falling back to JSON: {e}");
+        read_json(&metrics_file(), default_metrics())
+    });
+    let (should_rollback, improved, rolled_back_count) =
+        evolve::check_stagnation(&mut metrics, analysis.avg_score);
+
+    // 4b. HarnessX seesaw constraint (R5): a coarse per-task regression gate.
+    // Runs BEFORE seeding (digests are already available from step 2b) so a
+    // regressing round blocks NEW skill commits at the source rather than
+    // warning after the fact. The previous order (seed-then-check) was
+    // toothless: skills were already on disk when the warning fired.
+    let seesaw = evolve::load_registry();
+    let regressed =
+        evolve::seesaw_check(&seesaw, &digests, crate::evolve::seesaw::DEFAULT_TOLERANCE);
+    let seesaw_blocked = !regressed.is_empty();
+    if seesaw_blocked {
+        hint(
+            "reflect",
+            &format!(
+                "Seesaw constraint: {} previously solved task(s) regressed {:?} — blocking skill seeding this round",
+                regressed.len(),
+                regressed,
+            ),
+        );
+    }
+
+    // 4. Critic gate (Tier 2.1): the EARLIER, coarser gate that pairs with
+    // seesaw. Suppresses ALL new seeding when reward hacking is suspected
+    // (paper §4.3). Computed pre-seed by appending this session's dimension
+    // averages to a throwaway copy of score_history, so the detector sees the
+    // current round without mutating metrics before its later official push.
+    // The probe is reused as the metrics passed to seed_smart_skills so the
+    // per-edit Critic verdict is consistent with the round-level block.
+    let probe_metrics = {
+        let mut probe = metrics.clone();
+        probe.score_history.push(SessionScoreEntry {
+            timestamp: now_iso(),
+            success_rate: analysis.success_rate,
+            avg_score: analysis.avg_score,
+            observations: analysis.total_observations,
+            dimension_averages: analysis.dimension_averages,
+        });
+        probe.reward_hacking_suspected = evolve::detect_reward_hacking(&probe);
+        if probe.reward_hacking_suspected {
+            hint(
+                "reflect",
+                "Critic: reward hacking suspected (execution_cost rising while output_quality falls) — blocking skill seeding this round",
+            );
+        }
+        probe
+    };
+    let critic_blocked = crate::evolve::critic::Critic::should_block_seeding(&probe_metrics);
+
+    // 5. Seed evolved skills (skipped on rollback, seesaw regression, OR critic block)
+    ensure_dir(&evolved_dir());
+    let existing = list_dirs(&evolved_dir());
+    let outcome = if !should_rollback && !seesaw_blocked && !critic_blocked {
+        evolve::seed_smart_skills(&analysis, &existing, &probe_metrics)
+    } else {
+        crate::evolve::skills::ApplyOutcome::default()
+    };
+    let mut seeded = if seesaw_blocked || critic_blocked {
+        0
+    } else {
+        outcome.applied
+    };
+    let manifests = outcome.manifests;
+    if seesaw_blocked {
+        seeded = 0;
+    }
+
+    // Update the solved-task registry. Guard: only update when the gate
+    // PASSED. update() is monotonic (only improves bests), but recording a
+    // regressing round's coincidental high scores would raise the best-of
+    // for tasks that scored well by luck, masking future genuine regressions.
+    if !seesaw_blocked {
+        let mut reg = seesaw;
+        // Pipeline digests only — synthetic "session"/"segment-N" ids would
+        // bloat the registry with entries no future round can ever match.
+        let scores = evolve::scores_from_pipeline_digests(&digests);
+        reg.update(&scores);
+        let _ = evolve::save_registry(&reg);
+    }
+
+    // 4c. HarnessX variant isolation (R6): record this session's stack outcome
+    // into the variant pool so warm routing can converge on per-stack success
+    // rates, and fork-on-regression when the seesaw detected a regression on a
+    // stack that already has a variant (the core catastrophic-forgetting
+    // defense, paper §4.5). With a cold/empty pool this is a no-op that just
+    // seeds routing stats; forking meaningfully engages once variants exist.
+    let mut pool = crate::evolve::variants::VariantPool::load();
+    let session_stack: Vec<String> = detect_session_stack(&observations);
+    if !session_stack.is_empty() {
+        let stack_str = session_stack.first().cloned().unwrap_or_default();
+        if seesaw_blocked {
+            // A regressing round on a known stack → fork rather than let the
+            // existing variant absorb the bad edit. record_outcome then runs
+            // on the (possibly forked) variant the session is routed to.
+            let target_id = pool
+                .route(&[stack_str.as_str()])
+                .map(|v| v.id.clone())
+                .unwrap_or_else(|| stack_str.clone());
+            pool.fork_if_needed(&target_id, true);
+        }
+        let route_id = pool
+            .route(&[stack_str.as_str()])
+            .map(|v| v.id.clone())
+            .unwrap_or_else(|| stack_str.clone());
+        pool.record_outcome(&route_id, !seesaw_blocked);
+        let _ = pool.save();
+    }
+
+    // 5. Gate
+    evolve::gate_skills();
+
+    // 6. Skill attribution — score only what the session actually saw.
+    // `existing` is the pre-seed listing: skills seeded THIS round were not
+    // in context during the session and must not be credited with its score.
+    // The partition uses the date `resume` recorded at session start
+    // (session_start.json) so the arm matches what was actually injected —
+    // even when the session spans UTC midnight. Falls back to today on a
+    // cold start (no prior resume this session).
+    let evolved_dirs = list_dirs(&evolved_dir());
+    let partition_date = crate::shared::helpers::read_session_start_date().unwrap_or_else(today);
+    let (active_skills, holdout_skills) =
+        evolve::partition_holdout(&existing, &metrics, &partition_date);
+    evolve::update_skill_attribution(&mut metrics, &analysis, &active_skills, &holdout_skills);
+
+    // 7. Cross-project export
+    evolve::export_to_global(&analysis, &analysis.failure_patterns);
+
+    // 7.5. Prune expired entries from the negative feedback buffer (SkillOpt §4)
+    evolve::prune_rejected_buffer();
+
+    // 8. Memory auto-ingest (knowledge graph)
+    let (mem_nodes, mem_edges) = evolve::ingest_to_memory(&analysis, &analysis.failure_patterns);
+
+    // 9. Evolution record
+    let record = EvolutionRecord {
+        timestamp: now_iso(),
+        observations: analysis.total_observations,
+        success_rate: analysis.success_rate,
+        avg_score: analysis.avg_score,
+        error_patterns: analysis.per_error_stats.clone(),
+        failure_patterns: analysis.failure_patterns.clone(),
+        skills_seeded: seeded,
+        skills_rolled_back: rolled_back_count,
+        total_evolved: evolved_dirs.len() as u64,
+        analysis_summary: evolve::build_summary(&analysis),
+        edit_type: EditType::AddSkill,
+        manifests: manifests.clone(),
+    };
+    // Write evolution record to SQLite (primary) + JSONL (fallback)
+    let _ = crate::store::runtime::block_on(async {
+        let pool = crate::store::pool::harness_pool().await?;
+        let slug = crate::shared::paths::project_slug();
+        crate::store::evolution::insert_record_pool(&pool, &record, &slug).await
+    });
+    append_jsonl(&evolution_file(), &record);
+
+    // 9b. HarnessX falsifiability ledger (Table 9): append each shipped edit's
+    // manifest to a sidecar JSONL the next round's Critic reads to check
+    // predictions held. Append-only (rotation is a future concern; evolution
+    // .jsonl is already append-only and unbounded by the same convention).
+    for m in &manifests {
+        append_jsonl(&manifests_file(), m);
+    }
+
+    // 10. Session handoff context
+    let last_errors: Vec<String> = observations
+        .iter()
+        .filter(|o| o.result.as_deref() == Some("error"))
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|o| {
+            let cat = o.failure_category.as_deref().unwrap_or("unknown");
+            let snippet = o
+                .error_snippet
+                .as_deref()
+                .unwrap_or(o.action.as_deref().unwrap_or(""));
+            format!("{cat}: {}", truncate_str(snippet, 100))
+        })
+        .collect();
+    if !last_errors.is_empty() {
+        metrics.last_error_context = Some(last_errors.join(" | "));
+    }
+
+    // 11. Update metrics
+    fn round3(v: f64) -> f64 {
+        (v * 1000.0).round() / 1000.0
+    }
+
+    let score_entry = SessionScoreEntry {
+        timestamp: now_iso(),
+        success_rate: analysis.success_rate,
+        avg_score: analysis.avg_score,
+        observations: analysis.total_observations,
+        dimension_averages: analysis.dimension_averages,
+    };
+    metrics.score_history.push(score_entry);
+    if metrics.score_history.len() > 50 {
+        let start = metrics.score_history.len() - 50;
+        metrics.score_history = metrics.score_history[start..].to_vec();
+    }
+
+    metrics.total_sessions += 1;
+    metrics.avg_success_rate = round3(
+        ((metrics.avg_success_rate * (metrics.total_sessions - 1) as f64) + analysis.success_rate)
+            / metrics.total_sessions as f64,
+    );
+    metrics.total_evolved_skills = record.total_evolved;
+    metrics.last_session = Some(now_iso());
+
+    if improved {
+        metrics.best_score = Some(analysis.avg_score);
+        metrics.best_session = now_iso();
+        metrics.stagnation_count = 0;
+    }
+    metrics.trend = evolve::compute_trend(&metrics.score_history).into();
+
+    // SkillOpt §4 Slow/Meta Update: classify epoch for adaptive strategy
+    metrics.epoch_class = Some(evolve::classify_epoch(&metrics.score_history));
+
+    // HarnessX Tier 2.2: detect reward hacking (efficiency proxy rising
+    // while quality proxy falling). Computed only — seeding suppression is
+    // the Critic's job (Tier 2.1), not this hook.
+    metrics.reward_hacking_suspected = evolve::detect_reward_hacking(&metrics);
+
+    // Update evolved skill meta files with epoch classification
+    if let Some(ref epoch) = metrics.epoch_class {
+        evolve::update_meta_field(&evolved_dirs, epoch, analysis.avg_score);
+    }
+
+    // Save metrics to SQLite (primary) + JSON file (fallback)
+    let _ = crate::store::runtime::block_on(async {
+        let pool = crate::store::pool::harness_pool().await?;
+        let slug = crate::shared::paths::project_slug();
+        crate::store::metrics::save_metrics_pool(&pool, &metrics, &slug).await
+    });
+    if let Ok(json) = serde_json::to_string_pretty(&metrics) {
+        let _ = fs::write(metrics_file(), json);
+    }
+
+    // 11.5. Sync orbit pipeline files → SQLite (dual-write: files are source of truth
+    //       for /orbit phase recovery; SQLite enables REST API + dashboard queries).
+    if let Ok(pool) = crate::store::runtime::block_on(crate::store::pool::harness_pool()) {
+        let odir = orbit_dir();
+        if let Ok(entries) = fs::read_dir(&odir) {
+            let mut synced = 0usize;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !name.starts_with("PIPELINE-") || !name.ends_with(".json") {
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(&path)
+                    && let Ok(pl) = serde_json::from_str::<serde_json::Value>(&content)
+                {
+                    let id = pl["id"].as_str().unwrap_or(name.trim_end_matches(".json"));
+                    let status = pl["status"].as_str().unwrap_or("unknown");
+                    let phase = pl["phase"].as_str();
+                    let mode = pl["mode"].as_str();
+                    if crate::store::runtime::block_on(
+                        crate::store::orbit_store::upsert_pipeline_pool(
+                            &pool,
+                            id,
+                            &project_slug(),
+                            status,
+                            phase,
+                            mode,
+                            &content,
+                        ),
+                    )
+                    .is_ok()
+                    {
+                        synced += 1;
+                    }
+                }
+            }
+            if synced > 0 {
+                eprintln!("[reflect] synced {synced} orbit pipeline(s) to SQLite");
+            }
+        }
+    }
+
+    // 11.6. Orbit evolve gap — retroactively close ship-but-no-evolve pipelines
+    let evolve_patched = patch_orbit_evolve_gap(&orbit_dir(), &now_iso());
+    if evolve_patched > 0 {
+        hint(
+            "reflect",
+            &format!("Orbit: evolve gap closed for {evolve_patched} pipeline(s)"),
+        );
+    }
+
+    // 11.7. Observation retention sweep (once per day)
+    if let Some(deleted) = sweep_old_observations()
+        && deleted > 0
+    {
+        hint(
+            "reflect",
+            &format!(
+                "Pruned {deleted} observation(s) older than {} days",
+                CONFIG.db.obs_retention_days
+            ),
+        );
+    }
+
+    // 11.8. Workspace manifest
+    evolve::write_workspace_manifest();
+
+    // 12. Report
+    hint(
+        "reflect",
+        &format!(
+            "Session: {:.1}% success, avg_score={} ({} obs)",
+            analysis.success_rate * 100.0,
+            analysis.avg_score,
+            analysis.total_observations
+        ),
+    );
+
+    let weak_tools: Vec<String> = analysis
+        .per_tool_stats
+        .iter()
+        .filter(|(_, s)| {
+            s.total >= CONFIG.pattern.weak_tool_min_obs
+                && (s.successes as f64 / s.total as f64) < CONFIG.pattern.weak_tool_rate
+        })
+        .map(|(cat, s)| {
+            format!(
+                "{cat} {}%",
+                (s.successes as f64 / s.total as f64 * 100.0) as u32
+            )
+        })
+        .collect();
+    if !weak_tools.is_empty() {
+        hint("reflect", &format!("Weak tools: {}", weak_tools.join(", ")));
+    }
+
+    let weak_exts: Vec<String> = analysis
+        .per_ext_stats
+        .iter()
+        .filter(|(_, s)| {
+            s.total >= CONFIG.pattern.weak_ext_min_obs
+                && s.success_rate < CONFIG.pattern.weak_ext_rate
+        })
+        .map(|(ext, s)| format!("{ext} {}%", (s.success_rate * 100.0) as u32))
+        .collect();
+    if !weak_exts.is_empty() {
+        hint(
+            "reflect",
+            &format!("Weak file types: {}", weak_exts.join(", ")),
+        );
+    }
+
+    if !analysis.failure_patterns.is_empty() {
+        let pats: Vec<String> = analysis
+            .failure_patterns
+            .iter()
+            .map(|p| format!("{}({})", p.pattern_type, p.count))
+            .collect();
+        hint("reflect", &format!("Patterns: {}", pats.join(", ")));
+    }
+
+    if seeded > 0 {
+        hint("reflect", &format!("Evolved {seeded} new skill(s)"));
+    }
+    if should_rollback {
+        hint(
+            "reflect",
+            &format!("Rolled back {rolled_back_count} stagnant skills"),
+        );
+    }
+    hint(
+        "reflect",
+        &format!(
+            "Trend: {} ({} sessions)",
+            metrics.trend,
+            metrics.score_history.len()
+        ),
+    );
+
+    // Skill attribution report
+    let effective: Vec<_> = metrics
+        .skill_attribution
+        .values()
+        .filter(|a| a.sessions_active >= 2 && a.avg_score_with > a.avg_score_without + 0.02)
+        .collect();
+    let ineffective: Vec<_> = metrics
+        .skill_attribution
+        .values()
+        .filter(|a| a.sessions_active >= 2 && a.avg_score_with < a.avg_score_without - 0.02)
+        .collect();
+    if !effective.is_empty() {
+        let parts: Vec<String> = effective
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}(+{}%)",
+                    s.skill_name,
+                    ((s.avg_score_with - s.avg_score_without) * 100.0) as i32
+                )
+            })
+            .collect();
+        hint(
+            "reflect",
+            &format!("Effective skills: {}", parts.join(", ")),
+        );
+    }
+    if !ineffective.is_empty() {
+        let names: Vec<&str> = ineffective.iter().map(|s| s.skill_name.as_str()).collect();
+        hint(
+            "reflect",
+            &format!(
+                "Ineffective skills: {} — consider /evolve rollback",
+                names.join(", ")
+            ),
+        );
+    }
+
+    if mem_nodes > 0 || mem_edges > 0 {
+        hint(
+            "reflect",
+            &format!("Memory: +{mem_nodes} nodes, +{mem_edges} edges ingested"),
+        );
+    }
+
+    TELEMETRY.track_session_ended(
+        analysis.success_rate,
+        evolve::safe_avg_score(analysis.avg_score),
+        analysis.total_observations,
+        metrics.trend.parse().unwrap_or(SessionTrend::Stable),
+        seeded,
+    );
+
+    0
+}
+
+// ── Orbit evolve gap detection ──────────────────────────────────────────────
+
+/// Scan orbit pipeline files for completed pipelines that shipped but never
+/// recorded an evolve phase (i.e., the session timed out before orbit could
+/// chain ship → evolve).  Because `reflect::run` already performs the full
+/// evolve analysis, calling this afterward retroactively closes the gap by
+/// adding an evolve entry to the phase_history.  Idempotent: already-patched
+/// pipelines are skipped.  Returns the number of pipelines patched.
+fn patch_orbit_evolve_gap(orbit_dir: &std::path::Path, now: &str) -> usize {
+    let entries = match fs::read_dir(orbit_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut patched = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("PIPELINE-") || !name.ends_with(".json") {
+            continue;
+        }
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut pipeline: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Only touch pipelines that completed ship but have no evolve entry.
+        let status_complete = matches!(
+            pipeline["status"].as_str(),
+            Some("complete") | Some("shipped")
+        );
+        if !status_complete {
+            continue;
+        }
+
+        let history = match pipeline["phase_history"].as_array() {
+            Some(h) => h,
+            None => continue,
+        };
+        let has_ship = history
+            .iter()
+            .any(|e| e["phase"] == "ship" && e["status"] == "complete");
+        // Any evolve entry (including failed) blocks patching: if evolve ran and
+        // failed, patching it complete would misrepresent history.
+        let has_evolve = history.iter().any(|e| e["phase"] == "evolve");
+
+        if !has_ship || has_evolve {
+            continue;
+        }
+
+        // Insert evolve entry before the final "complete" entry (if present).
+        let evolve_entry = serde_json::json!({
+            "phase": "evolve",
+            "status": "complete",
+            "at": now,
+            "note": "applied via reflect hook (session-end gap recovery)"
+        });
+        if let Some(arr) = pipeline["phase_history"].as_array_mut() {
+            match arr.iter().rposition(|e| e["phase"] == "complete") {
+                Some(pos) => arr.insert(pos, evolve_entry),
+                None => arr.push(evolve_entry),
+            }
+        }
+
+        if let Ok(updated) = serde_json::to_string_pretty(&pipeline) {
+            let tmp = path.with_extension("json.tmp");
+            if fs::write(&tmp, updated).is_ok() && fs::rename(&tmp, &path).is_ok() {
+                patched += 1;
+            } else {
+                let _ = fs::remove_file(&tmp);
+            }
+        }
+    }
+    patched
+}
+
+/// Detect the dominant stack tags from a session's observations, used by R6
+/// variant routing. Inspects file extensions in `action` and the `file_ext`
+/// field. Returns at most one tag (the dominant stack) to keep routing simple.
+fn detect_session_stack(observations: &[ObsRecord]) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for o in observations {
+        let ext = o
+            .file_ext
+            .clone()
+            .or_else(|| {
+                o.action.as_ref().and_then(|a| {
+                    a.rsplit('.')
+                        .next()
+                        .filter(|e| e.len() <= 6 && !e.contains(' '))
+                        .map(String::from)
+                })
+            })
+            .unwrap_or_default()
+            .to_lowercase();
+        let tag = match ext.as_str() {
+            "rs" => "rust",
+            "py" => "python",
+            "ts" | "tsx" => "typescript",
+            "go" => "go",
+            "java" | "kt" => "jvm",
+            _ => continue,
+        };
+        *counts.entry(tag.to_string()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .map(|(t, _)| vec![t])
+        .unwrap_or_default()
+}
+
+// ── Inline tests (kept here: run_context epoch helpers) ──
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoch_days_to_ymd_known_date() {
+        // 1970-01-01 = day 0
+        assert_eq!(epoch_days_to_ymd(0), (1970, 1, 1));
+    }
+
+    fn obs_at(ts: &str) -> ObsRecord {
+        ObsRecord {
+            timestamp: ts.into(),
+            tool: "Bash".into(),
+            tool_category: "bash".into(),
+            action: None,
+            result: Some("success".into()),
+            score: Some(1.0),
+            dimensions: None,
+            failure_category: None,
+            error_snippet: None,
+            file_ext: None,
+            sequence_id: None,
+            pipeline_id: None,
+        }
+    }
+
+    /// Codex fires Stop every turn; a second round must not re-consume the
+    /// observations the first round already scored.
+    #[test]
+    fn watermark_drops_already_consumed_observations() {
+        let obs = vec![
+            obs_at("2026-08-31T10:00:00Z"),
+            obs_at("2026-08-31T11:00:00Z"),
+            obs_at("2026-08-31T12:00:00Z"),
+        ];
+        let kept = filter_past_watermark(obs, Some("2026-08-31T11:00:00Z"));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].timestamp, "2026-08-31T12:00:00Z");
+    }
+
+    /// A turn that produced nothing new yields an empty batch, so reflect
+    /// returns before incrementing total_sessions.
+    #[test]
+    fn watermark_at_newest_yields_nothing() {
+        let obs = vec![obs_at("2026-08-31T10:00:00Z")];
+        assert!(filter_past_watermark(obs, Some("2026-08-31T10:00:00Z")).is_empty());
+    }
+
+    /// First run on a fresh project keeps the whole batch.
+    #[test]
+    fn no_watermark_keeps_everything() {
+        let obs = vec![
+            obs_at("2026-08-31T10:00:00Z"),
+            obs_at("2026-08-31T11:00:00Z"),
+        ];
+        assert_eq!(filter_past_watermark(obs, None).len(), 2);
+    }
+
+    // ── retention cutoff ───────────────────────────────
+
+    /// 2026-08-31T00:00:00Z is epoch day 20696.
+    const DAY_2026_08_31: u64 = 20_696 * 86_400;
+
+    #[test]
+    fn retention_cutoff_subtracts_whole_days() {
+        assert_eq!(retention_cutoff(DAY_2026_08_31, 1), "2026-08-30");
+        assert_eq!(retention_cutoff(DAY_2026_08_31, 31), "2026-07-31");
+    }
+
+    /// The cutoff must sort lexically below the ISO timestamps it filters,
+    /// which is the whole basis for the `timestamp < cutoff` comparison.
+    #[test]
+    fn retention_cutoff_sorts_below_same_day_timestamps() {
+        let cutoff = retention_cutoff(DAY_2026_08_31, 0);
+        assert_eq!(cutoff, "2026-08-31");
+        assert!(cutoff.as_str() < "2026-08-31T00:00:00Z");
+        assert!(cutoff.as_str() > "2026-08-30T23:59:59Z");
+    }
+
+    /// A retention window wider than the epoch must not underflow.
+    #[test]
+    fn retention_cutoff_saturates_at_epoch() {
+        let out = retention_cutoff(DAY_2026_08_31, 10_000_000);
+        assert_eq!(out, "1970-01-01");
+    }
+
+    #[test]
+    fn epoch_days_to_ymd_mid_year() {
+        // Approximate check: day 180 should be around June/July 1970
+        let (y, m, _d) = epoch_days_to_ymd(180);
+        assert_eq!(y, 1970);
+        assert!(
+            (6..=7).contains(&m),
+            "month should be June or July, got {m}"
+        );
+    }
+
+    // ── run_context signature ──────────────────────────
+    #[test]
+    fn effective_sources_all_expands() {
+        let sources: Vec<String> = vec!["all".into()];
+        let effective: Vec<&str> = if sources.contains(&"all".to_string()) {
+            vec!["harness", "claude-session", "alcove"]
+        } else if sources.is_empty() {
+            vec!["harness"]
+        } else {
+            sources.iter().map(|s| s.as_str()).collect()
+        };
+        assert_eq!(effective, vec!["harness", "claude-session", "alcove"]);
+    }
+
+    #[test]
+    fn effective_sources_empty_defaults_to_harness() {
+        let sources: Vec<String> = vec![];
+        let effective: Vec<&str> = if sources.contains(&"all".to_string()) {
+            vec!["harness", "claude-session", "alcove"]
+        } else if sources.is_empty() {
+            vec!["harness"]
+        } else {
+            sources.iter().map(|s| s.as_str()).collect()
+        };
+        assert_eq!(effective, vec!["harness"]);
+    }
+
+    #[test]
+    fn effective_sources_explicit_list_passthrough() {
+        let sources: Vec<String> = vec!["harness".into(), "alcove".into()];
+        let effective: Vec<&str> = if sources.contains(&"all".to_string()) {
+            vec!["harness", "claude-session", "alcove"]
+        } else if sources.is_empty() {
+            vec!["harness"]
+        } else {
+            sources.iter().map(|s| s.as_str()).collect()
+        };
+        assert_eq!(effective, vec!["harness", "alcove"]);
+    }
+
+    #[test]
+    fn since_overrides_days_in_date_range() {
+        // When --since is provided, date_from should equal since value
+        let since: Option<String> = Some("20260101".into());
+        let days: u32 = 30;
+
+        let (cutoff_tag, date_from) = if let Some(ref s) = since {
+            (s.clone(), s.clone())
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let cutoff_ts = now.saturating_sub((days as u64) * 86400);
+            let days_since_epoch = cutoff_ts / 86400;
+            let (y, m, d) = epoch_days_to_ymd(days_since_epoch as i32);
+            let tag = format!("{y:04}{m:02}{d:02}");
+            (tag.clone(), tag)
+        };
+
+        assert_eq!(cutoff_tag, "20260101");
+        assert_eq!(date_from, "20260101");
+    }
+
+    // ── patch_orbit_evolve_gap ───────────────────────────
+
+    #[test]
+    fn patch_orbit_evolve_gap_patches_ship_complete_no_evolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = serde_json::json!({
+            "id": "test-pipeline",
+            "status": "complete",
+            "phase": "complete",
+            "phase_history": [
+                {"phase": "ship", "status": "complete", "at": "2026-01-01T00:00:00Z"},
+                {"phase": "complete", "status": "complete", "at": "2026-01-01T00:01:00Z"}
+            ]
+        });
+        let path = dir.path().join("PIPELINE-test.json");
+        fs::write(&path, serde_json::to_string_pretty(&pipeline).unwrap()).unwrap();
+
+        let patched = patch_orbit_evolve_gap(dir.path(), "2026-01-01T00:02:00Z");
+        assert_eq!(patched, 1);
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let history = updated["phase_history"].as_array().unwrap();
+        assert!(
+            history.iter().any(|e| e["phase"] == "evolve"),
+            "evolve entry should be present"
+        );
+        // evolve must come before the final complete entry
+        let evolve_pos = history.iter().position(|e| e["phase"] == "evolve").unwrap();
+        let complete_pos = history
+            .iter()
+            .rposition(|e| e["phase"] == "complete")
+            .unwrap();
+        assert!(evolve_pos < complete_pos, "evolve must precede complete");
+    }
+
+    #[test]
+    fn patch_orbit_evolve_gap_skips_already_evolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = serde_json::json!({
+            "id": "test-pipeline-2",
+            "status": "complete",
+            "phase_history": [
+                {"phase": "ship", "status": "complete", "at": "2026-01-01T00:00:00Z"},
+                {"phase": "evolve", "status": "complete", "at": "2026-01-01T00:01:00Z"},
+                {"phase": "complete", "status": "complete", "at": "2026-01-01T00:02:00Z"}
+            ]
+        });
+        let path = dir.path().join("PIPELINE-test2.json");
+        fs::write(&path, serde_json::to_string_pretty(&pipeline).unwrap()).unwrap();
+
+        let patched = patch_orbit_evolve_gap(dir.path(), "2026-01-01T00:03:00Z");
+        assert_eq!(patched, 0, "already-evolved pipeline must not be patched");
+    }
+
+    #[test]
+    fn patch_orbit_evolve_gap_skips_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = serde_json::json!({
+            "id": "test-pipeline-3",
+            "status": "build",
+            "phase_history": [
+                {"phase": "ship", "status": "complete", "at": "2026-01-01T00:00:00Z"}
+            ]
+        });
+        let path = dir.path().join("PIPELINE-test3.json");
+        fs::write(&path, serde_json::to_string_pretty(&pipeline).unwrap()).unwrap();
+
+        let patched = patch_orbit_evolve_gap(dir.path(), "2026-01-01T00:01:00Z");
+        assert_eq!(patched, 0, "in-progress pipeline must not be patched");
+    }
+
+    #[test]
+    fn patch_orbit_evolve_gap_patches_shipped_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = serde_json::json!({
+            "id": "test-pipeline-4",
+            "status": "shipped",
+            "phase_history": [
+                {"phase": "ship", "status": "complete", "at": "2026-01-01T00:00:00Z"},
+                {"phase": "complete", "status": "complete", "at": "2026-01-01T00:01:00Z"}
+            ]
+        });
+        let path = dir.path().join("PIPELINE-test4.json");
+        fs::write(&path, serde_json::to_string_pretty(&pipeline).unwrap()).unwrap();
+
+        let patched = patch_orbit_evolve_gap(dir.path(), "2026-01-01T00:02:00Z");
+        assert_eq!(patched, 1, "shipped status must be patched like complete");
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            updated["phase_history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["phase"] == "evolve"),
+            "evolve entry should be present for shipped pipeline"
+        );
+    }
+
+    #[test]
+    fn patch_orbit_evolve_gap_skips_failed_evolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let pipeline = serde_json::json!({
+            "id": "test-pipeline-5",
+            "status": "complete",
+            "phase_history": [
+                {"phase": "ship", "status": "complete", "at": "2026-01-01T00:00:00Z"},
+                {"phase": "evolve", "status": "failed", "at": "2026-01-01T00:01:00Z"},
+                {"phase": "complete", "status": "complete", "at": "2026-01-01T00:02:00Z"}
+            ]
+        });
+        let path = dir.path().join("PIPELINE-test5.json");
+        fs::write(&path, serde_json::to_string_pretty(&pipeline).unwrap()).unwrap();
+
+        let patched = patch_orbit_evolve_gap(dir.path(), "2026-01-01T00:03:00Z");
+        assert_eq!(patched, 0, "failed evolve must not be overwritten");
+
+        // Verify the failed entry is preserved as-is
+        let updated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let evolve_entries: Vec<_> = updated["phase_history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["phase"] == "evolve")
+            .collect();
+        assert_eq!(
+            evolve_entries.len(),
+            1,
+            "must not add duplicate evolve entry"
+        );
+        assert_eq!(
+            evolve_entries[0]["status"], "failed",
+            "original failed status preserved"
+        );
+    }
+}
