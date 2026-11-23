@@ -1,0 +1,11 @@
+{
+  "epic": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node registry/scripts/hooks/run.mjs session-start",
+        "timeout": 60
+      }
+    ]
+  }
+}
